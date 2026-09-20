@@ -49,7 +49,6 @@ export async function initializeDatabase() {
       sale_price NUMERIC(10, 2),
       brand_id INT NOT NULL REFERENCES brands(id) ON DELETE CASCADE,
       image_url TEXT,
-      is_featured BOOLEAN NOT NULL DEFAULT false,
       category_slug VARCHAR(100) REFERENCES subcategories(slug) ON DELETE SET NULL,
       created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
     );

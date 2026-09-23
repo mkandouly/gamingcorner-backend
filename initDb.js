@@ -35,6 +35,7 @@ export async function initializeDatabase() {
       name VARCHAR(100) NOT NULL,
       logo_url TEXT NOT NULL,
       is_featured BOOLEAN NOT NULL DEFAULT false,
+      is_popular BOOLEAN NOT NULL DEFAULT false,
       created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
     );
   `;

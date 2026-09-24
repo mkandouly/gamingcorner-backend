@@ -21,6 +21,8 @@ initializeDatabase();
 
 app.use(cors());
 app.use(express.json());
+// In your Express backend app entry file
+app.disable('etag');
 
 // Serve uploaded images statically
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));

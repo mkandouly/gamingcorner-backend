@@ -1,4 +1,4 @@
-import { query } from './db.js';
+import { query } from "./db.js";
 
 export async function initializeDatabase() {
   const createSubscribersTable = `
@@ -40,19 +40,36 @@ export async function initializeDatabase() {
     );
   `;
 
+  // Add to createProductsTable in dbInit.js:
   const createProductsTable = `
-    CREATE TABLE IF NOT EXISTS products (
+  CREATE TABLE IF NOT EXISTS products (
+    id SERIAL PRIMARY KEY,
+    sku VARCHAR(255) UNIQUE NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    price NUMERIC(10, 2) NOT NULL,
+    sale_price NUMERIC(10, 2),
+    brand_id INT NOT NULL REFERENCES brands(id) ON DELETE CASCADE,
+    image_url TEXT,
+    images JSONB DEFAULT '[]'::jsonb,
+    category_slug VARCHAR(100) REFERENCES subcategories(slug) ON DELETE SET NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+  );
+`;
+
+  const createProductSpecificationsTable = `
+    CREATE TABLE IF NOT EXISTS product_specifications (
       id SERIAL PRIMARY KEY,
-      sku VARCHAR(255) UNIQUE NOT NULL,
-      name VARCHAR(255) NOT NULL,
-      description TEXT,
-      price NUMERIC(10, 2) NOT NULL,
-      sale_price NUMERIC(10, 2),
-      brand_id INT NOT NULL REFERENCES brands(id) ON DELETE CASCADE,
-      image_url TEXT,
-      category_slug VARCHAR(100) REFERENCES subcategories(slug) ON DELETE SET NULL,
+      product_id INT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+      specification VARCHAR(255) NOT NULL,
+      details TEXT NOT NULL,
       created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
     );
+  `;
+
+  const createSpecsProductIndex = `
+    CREATE INDEX IF NOT EXISTS idx_product_specs_product_id 
+    ON product_specifications(product_id);
   `;
 
   const createAdminsTable = `
@@ -81,8 +98,8 @@ export async function initializeDatabase() {
   `;
 
   try {
-    console.log('Initializing database schema...');
-    
+    console.log("Initializing database schema...");
+
     // Independent tables
     await query(createSubscribersTable);
     await query(createCategoriesTable);
@@ -94,9 +111,13 @@ export async function initializeDatabase() {
     await query(createSubcategoriesTable);
     await query(createProductsTable);
 
-    console.log('Database tables verified/created successfully.');
+    // Product Specifications table & Index
+    await query(createProductSpecificationsTable);
+    await query(createSpecsProductIndex);
+
+    console.log("Database tables verified/created successfully.");
   } catch (error) {
-    console.error('Failed to initialize database schema:', error);
+    console.error("Failed to initialize database schema:", error);
     throw error;
   }
 }

@@ -10,6 +10,7 @@ import featuredSubcategoriesRoute from "./src/routes/featuredSubcategories.js";
 import brandIsPopularRoute from "./src/routes/brandIsPopular.js";
 import featuredBrandsRoute from "./src/routes/featuredBrands.js";
 import brandProductsRoute from "./src/routes/brandProducts.js";
+import productsRoute from "./src/routes/productsRoutes.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -41,6 +42,8 @@ app.use('/api/popularbrands', brandIsPopularRoute);
 app.use('/api/brands', featuredBrandsRoute);
 
 app.use('/api/brand', brandProductsRoute);
+
+app.use('/api/products', productsRoute);
 
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);

@@ -10,6 +10,7 @@ router.get("/", async (req, res) => {
         c.id AS category_id,
         c.name AS category_name,
         c.slug AS category_slug,
+        c.is_hot AS category_is_hot,
         s.id AS subcategory_id,
         s.name AS subcategory_name,
         s.slug AS subcategory_slug,
@@ -29,7 +30,7 @@ router.get("/", async (req, res) => {
           id: row.category_id,
           name: row.category_name,
           slug: row.category_slug,
-          is_hot: false,
+          is_hot: Boolean(row.category_is_hot),
           subcategories: [],
         };
       }

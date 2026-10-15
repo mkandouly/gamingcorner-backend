@@ -63,9 +63,22 @@ const STATUS_LABELS = {
   cancelled: 'Cancelled',
 };
 
+// Everything a customer typed at checkout (name, address, etc.) ends up in
+// these HTML emails, including the one sent to the store's own inbox — so it
+// must be escaped, or a checkout form becomes a way to inject HTML/links
+// into mail the store trusts.
+function esc(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 function itemsToHtml(items) {
   return items
-    .map((i) => `<li>${i.product_name} x ${i.quantity} - $${Number(i.line_total).toFixed(2)}</li>`)
+    .map((i) => `<li>${esc(i.product_name)} x ${esc(i.quantity)} - $${Number(i.line_total).toFixed(2)}</li>`)
     .join('');
 }
 
@@ -86,12 +99,12 @@ export async function sendOrderConfirmationEmail(order, items = []) {
         to: order.email,
         subject: `Order #${order.id} confirmed`,
         html: `
-          <h2>Thanks for your order, ${order.first_name}!</h2>
+          <h2>Thanks for your order, ${esc(order.first_name)}!</h2>
           <p>Order #${order.id} has been placed and is now <strong>Pending</strong>.</p>
           <ul>${itemsHtml}</ul>
           <p><strong>Subtotal: $${subtotal}</strong></p>
           <p>Delivery cost will be confirmed by the store shortly.</p>
-          <p>Address: ${order.address_line}, ${order.area}, ${order.city}, ${order.governorate}</p>
+          <p>Address: ${esc(order.address_line)}, ${esc(order.area)}, ${esc(order.city)}, ${esc(order.governorate)}</p>
         `,
       })
     );
@@ -104,8 +117,8 @@ export async function sendOrderConfirmationEmail(order, items = []) {
         subject: `New order #${order.id}`,
         html: `
           <h2>New order #${order.id}</h2>
-          <p>${order.first_name} ${order.last_name} - ${order.phone_country_code}${order.phone_number}</p>
-          <p>${order.address_line}, ${order.area}, ${order.city}, ${order.governorate}</p>
+          <p>${esc(order.first_name)} ${esc(order.last_name)} - ${esc(order.phone_country_code)}${esc(order.phone_number)}</p>
+          <p>${esc(order.address_line)}, ${esc(order.area)}, ${esc(order.city)}, ${esc(order.governorate)}</p>
           <ul>${itemsHtml}</ul>
           <p><strong>Subtotal: $${subtotal}</strong></p>
         `,
@@ -128,7 +141,7 @@ export async function sendOrderStatusEmail(order) {
     subject: `Order #${order.id} is now ${label}`,
     html: `
       <h2>Order #${order.id} update</h2>
-      <p>Your order status is now: <strong>${label}</strong>.</p>
+      <p>Your order status is now: <strong>${esc(label)}</strong>.</p>
       ${order.status === 'cancelled' ? '<p>If you believe this is a mistake, please contact the store.</p>' : ''}
     `,
   });

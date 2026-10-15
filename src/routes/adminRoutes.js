@@ -58,6 +58,12 @@ function uniqueViolationMessage(err, fallback) {
   return fallback;
 }
 
+// Serial numbers are normalized to uppercase, trimmed, on every write and
+// every lookup — for both stock-in serials and sold-unit serials — so
+// "abc123" and "ABC123" are always treated as the same physical unit
+// regardless of how staff type it in.
+const normalizeSerial = (s) => String(s || '').trim().toUpperCase();
+
 // Ensure 'uploads' directory exists
 const uploadDir = path.join(process.cwd(), 'uploads');
 if (!fs.existsSync(uploadDir)) {
@@ -171,6 +177,9 @@ router.put('/categories/:id', requirePermission('categories.edit'), async (req, 
       'UPDATE categories SET name = $1, slug = $2, is_hot = $3 WHERE id = $4 RETURNING *',
       [name, slug, is_hot || false, id]
     );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Category not found.' });
+    }
     res.json({ success: true, data: result.rows[0] });
   } catch (err) {
     if (isUniqueViolation(err)) {
@@ -229,6 +238,9 @@ router.put('/subcategories/:id', requirePermission('subcategories.edit'), async 
       'UPDATE subcategories SET name = $1, slug = $2, parent_id = $3, is_featured = $4 WHERE id = $5 RETURNING *',
       [name, slug, parent_id, is_featured || false, id]
     );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Subcategory not found.' });
+    }
     res.json({ success: true, data: result.rows[0] });
   } catch (err) {
     if (isUniqueViolation(err)) {
@@ -304,6 +316,9 @@ router.put('/brands/:id', requirePermission('brands.edit'), async (req, res) => 
       'UPDATE brands SET name = $1, logo_url = $2, is_featured = $3, is_popular = $4 WHERE id = $5 RETURNING *',
       [name, logo_url || null, is_featured || false, is_popular || false, id]
     );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Brand not found.' });
+    }
     res.json({ success: true, data: result.rows[0] });
   } catch (err) {
     if (isUniqueViolation(err)) {
@@ -461,6 +476,9 @@ router.put('/products/:id', requirePermission('products.edit'), async (req, res)
         id,
       ]
     );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Product not found.' });
+    }
     res.json({ success: true, data: result.rows[0] });
   } catch (err) {
     if (isUniqueViolation(err)) {
@@ -590,6 +608,9 @@ router.put('/banners/:id', requirePermission('banners.edit'), async (req, res) =
       'UPDATE banners SET title = $1, image_url = $2, link = $3, is_active = $4 WHERE id = $5 RETURNING *',
       [title, image_url, link, is_active ?? true, id]
     );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Banner not found.' });
+    }
     res.json({ success: true, data: result.rows[0] });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
@@ -759,7 +780,7 @@ router.patch('/orders/:id/delivery-price', requirePermission('orders.set_deliver
 router.get('/stock-receipts', requirePermission('serials.view'), async (req, res) => {
   try {
     const { page, limit, offset } = getPagination(req);
-    const { sku, search, source } = req.query;
+    const { sku, search, source, q } = req.query;
 
     const conditions = [];
     const params = [];
@@ -776,15 +797,36 @@ router.get('/stock-receipts', requirePermission('serials.view'), async (req, res
       params.push(`%${source.trim()}%`);
       conditions.push(`sr.source ILIKE $${params.length}`);
     }
+    // One search box in the admin UI: matches source, SKU, or any serial
+    // number logged on the receipt (serials are stored uppercase).
+    if (q?.trim()) {
+      params.push(`%${q.trim()}%`);
+      const textIdx = params.length;
+      params.push(`%${normalizeSerial(q)}%`);
+      const serialIdx = params.length;
+      conditions.push(`(
+        sr.source ILIKE $${textIdx}
+        OR sr.sku ILIKE $${textIdx}
+        OR EXISTS (
+          SELECT 1 FROM stock_receipt_serials rs
+          WHERE rs.receipt_id = sr.id AND rs.serial_number LIKE $${serialIdx}
+        )
+      )`);
+    }
 
     const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 
     const sql = `
-      SELECT sr.*, p.name AS product_name
+      SELECT sr.*, p.name AS product_name,
+             COALESCE(
+               (SELECT json_agg(rs.serial_number ORDER BY rs.id)
+                FROM stock_receipt_serials rs WHERE rs.receipt_id = sr.id),
+               '[]'::json
+             ) AS serial_numbers
       FROM stock_receipts sr
       LEFT JOIN products p ON p.id = sr.product_id
       ${whereClause}
-      ORDER BY sr.received_at DESC
+      ORDER BY sr.received_at DESC, sr.id DESC
       LIMIT $${params.length + 1} OFFSET $${params.length + 2}
     `;
     const countSql = `SELECT COUNT(*)::int AS count FROM stock_receipts sr ${whereClause}`;
@@ -800,31 +842,105 @@ router.get('/stock-receipts', requirePermission('serials.view'), async (req, res
   }
 });
 
+// Log stock received. Two ways, same endpoint:
+//   - by quantity:        { sku, quantity, cost_price, ... }
+//   - by serial numbers:  { sku, serial_numbers: ['SN1', 'SN2', ...], cost_price, ... }
+// With serial_numbers, quantity is ignored and set to how many serials were
+// given, and each serial is stored against this receipt so a later warranty
+// lookup can trace that exact unit back to its source.
 router.post('/stock-receipts', requirePermission('serials.manage'), async (req, res) => {
+  const { product_id, sku, quantity, cost_price, source, notes, serial_numbers } = req.body;
+
+  const resolvedSku = sku?.trim();
+  if (!resolvedSku) {
+    return res.status(400).json({ success: false, message: 'SKU is required (pick a product or type one in).' });
+  }
+
+  let serials = [];
+  if (serial_numbers !== undefined && serial_numbers !== null) {
+    if (!Array.isArray(serial_numbers)) {
+      return res.status(400).json({ success: false, message: 'serial_numbers must be a list.' });
+    }
+    serials = serial_numbers.map(normalizeSerial).filter(Boolean);
+    const seen = new Set();
+    for (const sn of serials) {
+      if (seen.has(sn)) {
+        return res.status(400).json({ success: false, message: `Serial number "${sn}" is listed twice.` });
+      }
+      seen.add(sn);
+    }
+  }
+
+  const qty = serials.length > 0 ? serials.length : Number(quantity);
+  if (!Number.isInteger(qty) || qty <= 0) {
+    return res.status(400).json({ success: false, message: 'Quantity must be a whole number above zero.' });
+  }
+  const cost = Number(cost_price);
+  if (cost_price === '' || cost_price === null || cost_price === undefined || !Number.isFinite(cost) || cost < 0) {
+    return res.status(400).json({ success: false, message: 'Cost price must be a non-negative number.' });
+  }
+
+  const client = await pool.connect();
   try {
-    const { product_id, sku, quantity, cost_price, source, notes } = req.body;
+    await client.query('BEGIN');
 
-    const resolvedSku = sku?.trim();
-    if (!resolvedSku) {
-      return res.status(400).json({ success: false, message: 'SKU is required (pick a product or type one in).' });
-    }
-    const qty = Number(quantity);
-    if (!Number.isFinite(qty) || qty <= 0) {
-      return res.status(400).json({ success: false, message: 'Quantity must be a positive number.' });
-    }
-    const cost = Number(cost_price);
-    if (!Number.isFinite(cost) || cost < 0) {
-      return res.status(400).json({ success: false, message: 'Cost price must be a non-negative number.' });
-    }
-
-    const result = await pool.query(
+    const result = await client.query(
       `INSERT INTO stock_receipts (product_id, sku, quantity, cost_price, source, notes, received_at)
        VALUES ($1, $2, $3, $4, $5, $6, NOW())
        RETURNING *`,
       [product_id || null, resolvedSku, qty, cost, source?.trim() || null, notes?.trim() || null]
     );
+    const receipt = result.rows[0];
 
-    res.status(201).json({ success: true, data: result.rows[0] });
+    if (serials.length > 0) {
+      await client.query(
+        `INSERT INTO stock_receipt_serials (receipt_id, serial_number)
+         SELECT $1, UNNEST($2::varchar[])`,
+        [receipt.id, serials]
+      );
+    }
+
+    await client.query('COMMIT');
+    res.status(201).json({ success: true, data: { ...receipt, serial_numbers: serials } });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    if (isUniqueViolation(err)) {
+      const match = (err.detail || '').match(/=\(([^)]+)\)/);
+      return res.status(409).json({
+        success: false,
+        message: match
+          ? `Serial number "${match[1]}" was already logged as received in an earlier stock-in.`
+          : 'One of those serial numbers was already logged as received.',
+      });
+    }
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Look up one stock-in serial: which receipt it arrived on (SKU, product,
+// source, cost, date) and whether that unit has been sold since. Used by
+// the "Record a Sale" form to pre-fill the product as soon as staff type a
+// serial that was logged on the way in.
+router.get('/stock-in-serials/:serialNumber', requirePermission('serials.view'), async (req, res) => {
+  try {
+    const serial = normalizeSerial(req.params.serialNumber);
+    const result = await pool.query(
+      `SELECT rs.serial_number, sr.id AS receipt_id, sr.sku, sr.product_id, p.name AS product_name,
+              sr.source, sr.cost_price, sr.received_at,
+              EXISTS (SELECT 1 FROM product_serials ps WHERE ps.serial_number = rs.serial_number) AS sold
+       FROM stock_receipt_serials rs
+       JOIN stock_receipts sr ON sr.id = rs.receipt_id
+       LEFT JOIN products p ON p.id = sr.product_id
+       WHERE rs.serial_number = $1`,
+      [serial]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'That serial number was not logged on any stock-in.' });
+    }
+    res.json({ success: true, data: result.rows[0] });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -845,10 +961,17 @@ router.delete('/stock-receipts/:id', requirePermission('serials.manage'), async 
 // ==========================================
 // SOLD UNITS / WARRANTY ("OUT") — serial number captured here, at sale time
 // ==========================================
-// serial_number is normalized to uppercase, trimmed, on every write and
-// every lookup, so "abc123" and "ABC123" are always treated as the same
-// physical unit regardless of how staff type it in.
-const normalizeSerial = (s) => String(s || '').trim().toUpperCase();
+// If a sold unit's serial was also logged when it came IN (stock-in by
+// serial number), surface where it came from — this is what a warranty
+// claim gets traced back to (which supplier, at what cost, when).
+const STOCK_IN_COLUMNS = `
+  sr_in.id AS stock_in_receipt_id,
+  sr_in.source AS stock_in_source,
+  sr_in.cost_price AS stock_in_cost_price,
+  sr_in.received_at AS stock_in_received_at`;
+const STOCK_IN_JOINS = `
+  LEFT JOIN stock_receipt_serials rs_in ON rs_in.serial_number = ps.serial_number
+  LEFT JOIN stock_receipts sr_in ON sr_in.id = rs_in.receipt_id`;
 
 router.get('/serials', requirePermission('serials.view'), async (req, res) => {
   try {
@@ -880,11 +1003,13 @@ router.get('/serials', requirePermission('serials.view'), async (req, res) => {
              o.warranty_months AS offer_warranty_months,
              CASE WHEN COALESCE(ps.warranty_months, o.warranty_months) IS NOT NULL
                   THEN ps.sold_at + (COALESCE(ps.warranty_months, o.warranty_months) || ' months')::interval
-                  ELSE NULL END AS warranty_expires_at
+                  ELSE NULL END AS warranty_expires_at,
+             ${STOCK_IN_COLUMNS}
       FROM product_serials ps
       LEFT JOIN products p ON p.id = ps.product_id
       LEFT JOIN pc_offers o ON o.id = ps.offer_id
       LEFT JOIN distributors d ON d.id = ps.distributor_id
+      ${STOCK_IN_JOINS}
       ${whereClause}
       ORDER BY ps.sold_at DESC
       LIMIT $${params.length + 1} OFFSET $${params.length + 2}
@@ -917,11 +1042,13 @@ router.get('/serials/:serialNumber', requirePermission('serials.view'), async (r
               o.notes AS offer_notes, o.order_id AS offer_order_id,
               CASE WHEN COALESCE(ps.warranty_months, o.warranty_months) IS NOT NULL
                    THEN ps.sold_at + (COALESCE(ps.warranty_months, o.warranty_months) || ' months')::interval
-                   ELSE NULL END AS warranty_expires_at
+                   ELSE NULL END AS warranty_expires_at,
+              ${STOCK_IN_COLUMNS}
        FROM product_serials ps
        LEFT JOIN products p ON p.id = ps.product_id
        LEFT JOIN pc_offers o ON o.id = ps.offer_id
        LEFT JOIN distributors d ON d.id = ps.distributor_id
+       ${STOCK_IN_JOINS}
        WHERE ps.serial_number = $1`,
       [serial]
     );
@@ -999,6 +1126,9 @@ router.post('/serials', requirePermission('serials.manage'), async (req, res) =>
         success: false,
         message: `Serial number "${normalizeSerial(req.body.serial_number)}" is already on record.`,
       });
+    }
+    if (err.code === '23503') {
+      return res.status(400).json({ success: false, message: 'That order or distributor no longer exists.' });
     }
     res.status(500).json({ success: false, error: err.message });
   }
@@ -1169,6 +1299,108 @@ router.post('/pc-offers', requirePermission('serials.manage'), async (req, res) 
         success: false,
         message: 'One of those serial numbers is already on record — check each item and try again.',
       });
+    }
+    if (err.code === '23503') {
+      return res.status(400).json({ success: false, message: 'No order exists with that Order ID.' });
+    }
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Edit a PC Offer after it was recorded — warranty length, total price,
+// linked order, notes. Only the fields present in the body are changed.
+// The warranty lives on the offer header AND is copied onto every item row
+// (warranty lookups read the item's own value first), so a warranty change
+// is written to both inside one transaction to keep them in step.
+router.patch('/pc-offers/:id', requirePermission('serials.manage'), async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(404).json({ success: false, message: 'PC Offer not found.' });
+  }
+
+  const body = req.body || {};
+  const sets = [];
+  const params = [];
+  let warrantyChanged = false;
+  let warranty = null;
+
+  if ('warranty_months' in body) {
+    const raw = body.warranty_months;
+    if (raw !== null && raw !== '') {
+      warranty = Number(raw);
+      if (!Number.isInteger(warranty) || warranty < 0) {
+        return res.status(400).json({ success: false, message: 'Warranty must be a whole number of months.' });
+      }
+    }
+    params.push(warranty);
+    sets.push(`warranty_months = $${params.length}`);
+    warrantyChanged = true;
+  }
+  if ('sale_price' in body) {
+    const price = Number(body.sale_price);
+    if (body.sale_price === '' || body.sale_price === null || !Number.isFinite(price) || price < 0) {
+      return res.status(400).json({ success: false, message: 'Sale price must be a non-negative number.' });
+    }
+    params.push(price);
+    sets.push(`sale_price = $${params.length}`);
+  }
+  if ('order_id' in body) {
+    let orderId = null;
+    if (body.order_id !== null && body.order_id !== '') {
+      orderId = Number(body.order_id);
+      if (!Number.isInteger(orderId) || orderId < 1) {
+        return res.status(400).json({ success: false, message: 'Order ID must be a whole number.' });
+      }
+    }
+    params.push(orderId);
+    sets.push(`order_id = $${params.length}`);
+  }
+  if ('notes' in body) {
+    params.push(body.notes?.trim() || null);
+    sets.push(`notes = $${params.length}`);
+  }
+
+  if (sets.length === 0) {
+    return res.status(400).json({ success: false, message: 'Nothing to update.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    params.push(id);
+    const offerResult = await client.query(
+      `UPDATE pc_offers SET ${sets.join(', ')} WHERE id = $${params.length} RETURNING *`,
+      params
+    );
+    if (offerResult.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'PC Offer not found.' });
+    }
+    const offer = offerResult.rows[0];
+
+    if (warrantyChanged) {
+      await client.query('UPDATE product_serials SET warranty_months = $1 WHERE offer_id = $2', [warranty, id]);
+    }
+    if ('order_id' in body) {
+      await client.query('UPDATE product_serials SET order_id = $1 WHERE offer_id = $2', [offer.order_id, id]);
+    }
+
+    const itemsResult = await client.query(
+      `SELECT ps.*, p.name AS product_name
+       FROM product_serials ps LEFT JOIN products p ON p.id = ps.product_id
+       WHERE ps.offer_id = $1 ORDER BY ps.id ASC`,
+      [id]
+    );
+
+    await client.query('COMMIT');
+    res.json({ success: true, data: { ...offer, items: itemsResult.rows } });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    if (err.code === '23503') {
+      return res.status(400).json({ success: false, message: 'No order exists with that Order ID.' });
     }
     res.status(500).json({ success: false, error: err.message });
   } finally {

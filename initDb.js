@@ -89,6 +89,26 @@ export async function initializeDatabase() {
     CREATE INDEX IF NOT EXISTS idx_stock_receipts_source ON stock_receipts(source);
   `;
 
+  // Optional per-unit serial numbers for a stock receipt. A receipt can be
+  // logged either as a plain quantity (no rows here) or unit-by-unit by
+  // serial number (one row per unit, and the receipt's quantity equals the
+  // number of rows). This is what lets a warranty claim be traced back to
+  // where that exact unit came IN from (source, cost, date). serial_number
+  // is globally unique and stored uppercase/trimmed — the same normalization
+  // product_serials uses — so the IN record and the later sale record of a
+  // unit always match on the same value.
+  const createStockReceiptSerialsTable = `
+    CREATE TABLE IF NOT EXISTS stock_receipt_serials (
+      id SERIAL PRIMARY KEY,
+      receipt_id INT NOT NULL REFERENCES stock_receipts(id) ON DELETE CASCADE,
+      serial_number VARCHAR(255) NOT NULL UNIQUE,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+  `;
+  const createStockReceiptSerialsReceiptIndex = `
+    CREATE INDEX IF NOT EXISTS idx_stock_receipt_serials_receipt_id ON stock_receipt_serials(receipt_id);
+  `;
+
   // A "PC Offer" bundles several items (a build + peripherals) into one
   // sale at one combined price, rather than pricing each component
   // separately. The header (total price, shared warranty, order link)
@@ -402,6 +422,8 @@ export async function initializeDatabase() {
     await query(alterStockReceiptsAddSource);
     await query(createStockReceiptsSkuIndex);
     await query(createStockReceiptsSourceIndex);
+    await query(createStockReceiptSerialsTable);
+    await query(createStockReceiptSerialsReceiptIndex);
     await query(createPcOffersTable);
     await query(createProductSerialsTable);
     await query(alterProductSerialsForOffers);

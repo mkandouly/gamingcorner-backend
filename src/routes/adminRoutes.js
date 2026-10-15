@@ -1408,6 +1408,175 @@ router.patch('/pc-offers/:id', requirePermission('serials.manage'), async (req, 
   }
 });
 
+// ------------------------------------------------------------------
+// PC OFFER ITEMS — fix a wrong serial or product, add a forgotten item,
+// or remove one, after the offer was recorded.
+// ------------------------------------------------------------------
+// Items always inherit the offer's warranty, order link and sale date, so a
+// unit added later is under the same warranty clock as the rest of the
+// build (counted from when the offer was sold, not from when it was added).
+// Serial numbers stay optional per item and globally unique.
+
+async function loadOfferWithItems(db, offerId) {
+  const offer = await db.query('SELECT * FROM pc_offers WHERE id = $1', [offerId]);
+  if (offer.rows.length === 0) return null;
+  const items = await db.query(
+    `SELECT ps.*, p.name AS product_name
+     FROM product_serials ps LEFT JOIN products p ON p.id = ps.product_id
+     WHERE ps.offer_id = $1 ORDER BY ps.id ASC`,
+    [offerId]
+  );
+  return { ...offer.rows[0], items: items.rows };
+}
+
+function parseIds(req) {
+  const offerId = Number(req.params.id);
+  const itemId = req.params.itemId === undefined ? null : Number(req.params.itemId);
+  const ok = Number.isInteger(offerId) && offerId > 0 && (itemId === null || (Number.isInteger(itemId) && itemId > 0));
+  return ok ? { offerId, itemId } : null;
+}
+
+function offerItemError(res, err) {
+  if (isUniqueViolation(err)) {
+    const match = (err.detail || '').match(/=\(([^)]+)\)/);
+    return res.status(409).json({
+      success: false,
+      message: match ? `Serial number "${match[1]}" is already on record.` : 'That serial number is already on record.',
+    });
+  }
+  if (err.code === '23503') {
+    return res.status(400).json({ success: false, message: 'That product no longer exists.' });
+  }
+  return res.status(500).json({ success: false, error: err.message });
+}
+
+router.post('/pc-offers/:id/items', requirePermission('serials.manage'), async (req, res) => {
+  const ids = parseIds(req);
+  if (!ids) return res.status(404).json({ success: false, message: 'PC Offer not found.' });
+
+  const { product_id, sku, serial_number } = req.body || {};
+  if (!sku?.trim()) {
+    return res.status(400).json({ success: false, message: 'The item needs a SKU (pick a product or type one in).' });
+  }
+
+  try {
+    // Copy warranty / order / sale date from the offer inside the INSERT
+    // itself, so the values match the offer exactly (no round trip through
+    // JS, which would drop the timestamp's microseconds).
+    const inserted = await pool.query(
+      `INSERT INTO product_serials (offer_id, product_id, sku, serial_number, warranty_months, order_id, sold_at)
+       SELECT o.id, $2, $3, $4, o.warranty_months, o.order_id, o.sold_at
+       FROM pc_offers o WHERE o.id = $1
+       RETURNING offer_id`,
+      [
+        ids.offerId,
+        product_id || null,
+        sku.trim(),
+        serial_number?.trim() ? normalizeSerial(serial_number) : null,
+      ]
+    );
+    if (inserted.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'PC Offer not found.' });
+    }
+
+    res.status(201).json({ success: true, data: await loadOfferWithItems(pool, ids.offerId) });
+  } catch (err) {
+    offerItemError(res, err);
+  }
+});
+
+// Change an item's product/SKU and/or serial number. Only fields present in
+// the body change; sending serial_number as "" or null clears it (allowed —
+// not every peripheral has one).
+router.patch('/pc-offers/:id/items/:itemId', requirePermission('serials.manage'), async (req, res) => {
+  const ids = parseIds(req);
+  if (!ids) return res.status(404).json({ success: false, message: 'Item not found in this PC Offer.' });
+
+  const body = req.body || {};
+  const sets = [];
+  const params = [];
+
+  if ('sku' in body) {
+    if (!body.sku?.trim()) {
+      return res.status(400).json({ success: false, message: 'The item needs a SKU (pick a product or type one in).' });
+    }
+    params.push(body.sku.trim());
+    sets.push(`sku = $${params.length}`);
+  }
+  if ('product_id' in body) {
+    params.push(body.product_id || null);
+    sets.push(`product_id = $${params.length}`);
+  }
+  if ('serial_number' in body) {
+    params.push(body.serial_number?.trim() ? normalizeSerial(body.serial_number) : null);
+    sets.push(`serial_number = $${params.length}`);
+  }
+  if (sets.length === 0) {
+    return res.status(400).json({ success: false, message: 'Nothing to update.' });
+  }
+
+  try {
+    params.push(ids.itemId, ids.offerId);
+    const result = await pool.query(
+      `UPDATE product_serials SET ${sets.join(', ')}
+       WHERE id = $${params.length - 1} AND offer_id = $${params.length}
+       RETURNING id`,
+      params
+    );
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Item not found in this PC Offer.' });
+    }
+    res.json({ success: true, data: await loadOfferWithItems(pool, ids.offerId) });
+  } catch (err) {
+    offerItemError(res, err);
+  }
+});
+
+// Remove one item from an offer. The last item can't be removed — an offer
+// with nothing in it isn't a sale; delete the whole offer instead. The row
+// is locked so two people removing items at once can't empty the offer.
+router.delete('/pc-offers/:id/items/:itemId', requirePermission('serials.manage'), async (req, res) => {
+  const ids = parseIds(req);
+  if (!ids) return res.status(404).json({ success: false, message: 'Item not found in this PC Offer.' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const offer = await client.query('SELECT id FROM pc_offers WHERE id = $1 FOR UPDATE', [ids.offerId]);
+    if (offer.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'PC Offer not found.' });
+    }
+
+    const count = await client.query('SELECT COUNT(*)::int AS count FROM product_serials WHERE offer_id = $1', [ids.offerId]);
+    if (count.rows[0].count <= 1) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        success: false,
+        message: "That's the only item in this offer — delete the whole offer instead.",
+      });
+    }
+
+    const result = await client.query(
+      'DELETE FROM product_serials WHERE id = $1 AND offer_id = $2 RETURNING id',
+      [ids.itemId, ids.offerId]
+    );
+    if (result.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'Item not found in this PC Offer.' });
+    }
+
+    const data = await loadOfferWithItems(client, ids.offerId);
+    await client.query('COMMIT');
+    res.json({ success: true, data });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 router.delete('/pc-offers/:id', requirePermission('serials.manage'), async (req, res) => {
   try {
     // product_serials rows for this offer cascade-delete automatically

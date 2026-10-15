@@ -48,7 +48,7 @@ router.post('/', async (req, res) => {
 
     const productIds = items.map((i) => Number(i.product_id)).filter(Number.isFinite);
     const { rows: productRows } = await client.query(
-      `SELECT id, name, sku, price, sale_price FROM products WHERE id = ANY($1::int[])`,
+      `SELECT id, name, sku, price, sale_price, out_of_stock FROM products WHERE id = ANY($1::int[])`,
       [productIds]
     );
     const productMap = new Map(productRows.map((p) => [p.id, p]));
@@ -58,13 +58,18 @@ router.post('/', async (req, res) => {
 
     for (const item of items) {
       const product = productMap.get(Number(item.product_id));
-      const quantity = Number(item.quantity) || 0;
+      const quantity = Number(item.quantity);
 
       if (!product) {
         throw new Error(`Product ${item.product_id} is no longer available.`);
       }
-      if (quantity <= 0) {
+      // Whole units only — order_items.quantity is an INT, and a fractional
+      // quantity would otherwise be priced as-is but stored rounded.
+      if (!Number.isInteger(quantity) || quantity <= 0) {
         throw new Error(`Invalid quantity for ${product.name}.`);
+      }
+      if (product.out_of_stock) {
+        throw new Error(`${product.name} is out of stock.`);
       }
 
       const unitPrice = Number(product.sale_price ?? product.price ?? 0);
@@ -136,24 +141,31 @@ router.post('/', async (req, res) => {
   }
 });
 
-// GET /api/orders/:id — public order lookup, used by the order status /
-// confirmation page. Anyone with the order id/link can view it (no login
-// system exists in this app), same as most guest-checkout stores.
+// GET /api/orders/:id — public, used by the order confirmation page right
+// after checkout. Order ids are sequential integers, so this deliberately
+// returns NO customer details (name, phone, email, address) — otherwise
+// anyone could page through every customer's contact info by counting up
+// from 1. Anything that needs the full order goes through POST /lookup
+// below, which requires the phone number on file.
+const PUBLIC_ORDER_FIELDS = `id, status, subtotal, delivery_price,
+  subtotal + COALESCE(delivery_price, 0) AS total, created_at, updated_at`;
+
 router.get('/:id', async (req, res) => {
   try {
-    const { id } = req.params;
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id < 1) {
+      return res.status(404).json({ success: false, message: 'Order not found.' });
+    }
 
-    const orderResult = await pool.query(
-      `SELECT *, subtotal + COALESCE(delivery_price, 0) AS total FROM orders WHERE id = $1`,
-      [id]
-    );
+    const orderResult = await pool.query(`SELECT ${PUBLIC_ORDER_FIELDS} FROM orders WHERE id = $1`, [id]);
 
     if (orderResult.rows.length === 0) {
       return res.status(404).json({ success: false, message: 'Order not found.' });
     }
 
     const itemsResult = await pool.query(
-      `SELECT * FROM order_items WHERE order_id = $1 ORDER BY id ASC`,
+      `SELECT id, product_id, product_name, product_sku, unit_price, quantity, line_total
+       FROM order_items WHERE order_id = $1 ORDER BY id ASC`,
       [id]
     );
 
@@ -184,6 +196,14 @@ router.post('/lookup', async (req, res) => {
       return res.status(400).json({ success: false, message: 'Order ID and phone number are required.' });
     }
 
+    const orderId = Number(id);
+    if (!Number.isInteger(orderId) || orderId < 1) {
+      return res.status(404).json({
+        success: false,
+        message: "We couldn't find an order matching that ID and phone number.",
+      });
+    }
+
     const digitsOnly = String(phone_number).replace(/\D/g, '');
 
     const orderResult = await pool.query(
@@ -191,7 +211,7 @@ router.post('/lookup', async (req, res) => {
        FROM orders
        WHERE id = $1
          AND regexp_replace(phone_country_code || phone_number, '\\D', '', 'g') = $2`,
-      [id, digitsOnly]
+      [orderId, digitsOnly]
     );
 
     if (orderResult.rows.length === 0) {

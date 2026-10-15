@@ -83,16 +83,6 @@ export const PERMISSION_GROUPS = [
     permissions: [{ key: 'subscribers.view', label: 'View subscribers' }],
   },
   {
-    key: 'serials',
-    label: 'Serial Numbers / Warranty',
-    permissions: [
-      { key: 'serials.view', label: 'View serial numbers / look up warranty status' },
-      { key: 'serials.create', label: 'Mark a serial number as received (IN)' },
-      { key: 'serials.edit', label: 'Mark a serial number as sold (OUT) / edit notes' },
-      { key: 'serials.delete', label: 'Delete a serial number record' },
-    ],
-  },
-  {
     key: 'media',
     label: 'Media',
     permissions: [{ key: 'media.upload', label: 'Upload images' }],
@@ -112,7 +102,7 @@ export const PERMISSION_GROUPS = [
     label: 'Inventory & Warranty',
     permissions: [
       { key: 'serials.view', label: 'View stock receipts and sold-unit/warranty records' },
-      { key: 'serials.manage', label: 'Log stock received in, record sales with serial numbers' },
+      { key: 'serials.manage', label: 'Log stock received in, record sales and PC Offers, edit offer warranty' },
     ],
   },
 ];

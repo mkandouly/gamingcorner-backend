@@ -21,9 +21,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = 3000;
-
-initializeDatabase();
+const PORT = Number(process.env.PORT) || 3000;
 
 app.use(cors());
 app.use(express.json());
@@ -63,6 +61,17 @@ app.use('/api/settings', settingsRoutes);
 
 app.use('/api/banners', bannersPublicRoutes);
 
-app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
-});
+// Only start accepting requests once the schema is in place — otherwise the
+// first requests after a fresh deploy can hit tables that don't exist yet,
+// and a database failure would surface as an unhandled rejection instead of
+// a clean exit.
+initializeDatabase()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Server is running on port ${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error('Database initialization failed, not starting the server:', err);
+    process.exit(1);
+  });

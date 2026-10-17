@@ -64,6 +64,39 @@ function uniqueViolationMessage(err, fallback) {
 // regardless of how staff type it in.
 const normalizeSerial = (s) => String(s || '').trim().toUpperCase();
 
+// Field parsers shared by the sale routes. Each returns { value } on
+// success or { error } with a message ready to show in the admin panel.
+const blank = (v) => v === undefined || v === null || v === '';
+
+function parsePrice(v, label = 'Sale price') {
+  const n = Number(v);
+  if (blank(v) || !Number.isFinite(n) || n < 0) return { error: `${label} must be a non-negative number.` };
+  return { value: Math.round(n * 100) / 100 };
+}
+function parseWarranty(v) {
+  if (blank(v)) return { value: null };
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 0) return { error: 'Warranty must be a whole number of months.' };
+  return { value: n };
+}
+function parseOptionalId(v, label) {
+  if (blank(v)) return { value: null };
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 1) return { error: `${label} must be a whole number.` };
+  return { value: n };
+}
+function parseSoldAt(v) {
+  const d = new Date(v);
+  if (blank(v) || Number.isNaN(d.getTime())) return { error: 'Sale date is not a valid date.' };
+  if (d.getTime() > Date.now() + 24 * 60 * 60 * 1000) return { error: "Sale date can't be in the future." };
+  return { value: d.toISOString() };
+}
+// First serial named in a unique-violation detail, e.g. Key (serial_number)=(ABC).
+function duplicateSerialFrom(err) {
+  const match = (err.detail || '').match(/=\(([^)]+)\)/);
+  return match ? match[1] : null;
+}
+
 // Ensure 'uploads' directory exists
 const uploadDir = path.join(process.cwd(), 'uploads');
 if (!fs.existsSync(uploadDir)) {
@@ -405,6 +438,12 @@ router.delete('/distributors/:id', requirePermission('distributors.delete'), asy
     }
     res.json({ success: true, message: `Distributor ${req.params.id} deleted` });
   } catch (err) {
+    if (err.code === '23503') {
+      return res.status(409).json({
+        success: false,
+        message: "This distributor has sales on record, so it can't be deleted (their warranty records need it).",
+      });
+    }
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -985,14 +1024,16 @@ router.get('/serials', requirePermission('serials.view'), async (req, res) => {
       params.push(sku);
       conditions.push(`ps.sku = $${params.length}`);
     }
-    if (search) {
-      params.push(`%${normalizeSerial(search)}%`);
-      conditions.push(`ps.serial_number ILIKE $${params.length}`);
+    // Matches the serial number, SKU, product name or notes.
+    if (search?.trim()) {
+      params.push(`%${search.trim()}%`);
+      const i = params.length;
+      conditions.push(`(ps.serial_number ILIKE $${i} OR ps.sku ILIKE $${i} OR p.name ILIKE $${i} OR ps.notes ILIKE $${i})`);
     }
     if (type === 'distributor') {
-      conditions.push(`ps.distributor_id IS NOT NULL`);
+      conditions.push(`(ps.distributor_id IS NOT NULL OR ps.distributor_sale_id IS NOT NULL)`);
     } else if (type === 'client') {
-      conditions.push(`ps.distributor_id IS NULL`);
+      conditions.push(`ps.distributor_id IS NULL AND ps.distributor_sale_id IS NULL`);
     }
 
     const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
@@ -1011,10 +1052,11 @@ router.get('/serials', requirePermission('serials.view'), async (req, res) => {
       LEFT JOIN distributors d ON d.id = ps.distributor_id
       ${STOCK_IN_JOINS}
       ${whereClause}
-      ORDER BY ps.sold_at DESC
+      ORDER BY ps.sold_at DESC, ps.id DESC
       LIMIT $${params.length + 1} OFFSET $${params.length + 2}
     `;
-    const countSql = `SELECT COUNT(*)::int AS count FROM product_serials ps ${whereClause}`;
+    const countSql = `SELECT COUNT(*)::int AS count FROM product_serials ps
+      LEFT JOIN products p ON p.id = ps.product_id ${whereClause}`;
 
     const [rows, count] = await Promise.all([
       pool.query(sql, [...params, limit, offset]),
@@ -1040,6 +1082,7 @@ router.get('/serials/:serialNumber', requirePermission('serials.view'), async (r
       `SELECT ps.*, p.name AS product_name, p.image_url AS product_image_url, d.name AS distributor_name,
               o.sale_price AS offer_sale_price, o.warranty_months AS offer_warranty_months,
               o.notes AS offer_notes, o.order_id AS offer_order_id,
+              ds.notes AS distributor_sale_notes,
               CASE WHEN COALESCE(ps.warranty_months, o.warranty_months) IS NOT NULL
                    THEN ps.sold_at + (COALESCE(ps.warranty_months, o.warranty_months) || ' months')::interval
                    ELSE NULL END AS warranty_expires_at,
@@ -1048,6 +1091,7 @@ router.get('/serials/:serialNumber', requirePermission('serials.view'), async (r
        LEFT JOIN products p ON p.id = ps.product_id
        LEFT JOIN pc_offers o ON o.id = ps.offer_id
        LEFT JOIN distributors d ON d.id = ps.distributor_id
+       LEFT JOIN distributor_sales ds ON ds.id = ps.distributor_sale_id
        ${STOCK_IN_JOINS}
        WHERE ps.serial_number = $1`,
       [serial]
@@ -1076,13 +1120,19 @@ router.get('/serials/:serialNumber', requirePermission('serials.view'), async (r
   }
 });
 
-// Record a sale ("OUT") — this is where the serial number is captured.
-// distributor_id, when present, marks this as a distributor sale instead
-// of a regular client sale — PC Offers never set this, since distributors
-// don't buy built PCs.
+// Record a single client sale ("OUT") — this is where the serial number is
+// captured. Distributor sales go through /distributor-sales instead, since
+// one of those can hold many units across many SKUs under one header.
 router.post('/serials', requirePermission('serials.manage'), async (req, res) => {
   try {
     const { product_id, sku, serial_number, warranty_months, sale_price, order_id, distributor_id, notes } = req.body;
+
+    if (!blank(distributor_id)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Distributor sales are recorded through Distributor Sales (POST /api/admin/distributor-sales).',
+      });
+    }
 
     const resolvedSku = sku?.trim();
     if (!resolvedSku) {
@@ -1114,7 +1164,7 @@ router.post('/serials', requirePermission('serials.manage'), async (req, res) =>
         warranty,
         price,
         order_id || null,
-        distributor_id || null,
+        null,
         notes?.trim() || null,
       ]
     );
@@ -1134,20 +1184,588 @@ router.post('/serials', requirePermission('serials.manage'), async (req, res) =>
   }
 });
 
+// Deletes a standalone client sale. Units that belong to a PC Offer or a
+// distributor sale are removed from there instead — deleting them here
+// could leave an offer/sale empty or out of step with its header.
 router.delete('/serials/:serialNumber', requirePermission('serials.manage'), async (req, res) => {
   try {
     const serial = normalizeSerial(req.params.serialNumber);
-    const result = await pool.query('DELETE FROM product_serials WHERE serial_number = $1 RETURNING serial_number', [serial]);
-
-    if (result.rows.length === 0) {
+    const found = await pool.query(
+      'SELECT id, offer_id, distributor_sale_id FROM product_serials WHERE serial_number = $1',
+      [serial]
+    );
+    if (found.rows.length === 0) {
       return res.status(404).json({ success: false, message: 'No sale found with that serial number.' });
     }
+    const unit = found.rows[0];
+    if (unit.offer_id) {
+      return res.status(400).json({ success: false, message: `That unit is part of PC Offer #${unit.offer_id} — remove it from the offer instead.` });
+    }
+    if (unit.distributor_sale_id) {
+      return res.status(400).json({
+        success: false,
+        message: `That unit is part of distributor sale #${unit.distributor_sale_id} — remove it from that sale instead.`,
+      });
+    }
 
+    await pool.query('DELETE FROM product_serials WHERE id = $1', [unit.id]);
     res.json({ success: true, message: `Serial "${serial}" deleted.` });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
+
+// Edit a recorded client sale (by its row id, since the serial itself is
+// editable). Only fields present in the body change. PC Offer items and
+// distributor units are edited through their offer / distributor sale.
+router.patch('/serials/:id', requirePermission('serials.manage'), async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) {
+    return res.status(404).json({ success: false, message: 'Sale not found.' });
+  }
+  const body = req.body || {};
+  const sets = [];
+  const params = [];
+  const set = (col, value) => {
+    params.push(value);
+    sets.push(`${col} = $${params.length}`);
+  };
+
+  if ('sku' in body) {
+    if (!body.sku?.trim()) return res.status(400).json({ success: false, message: 'SKU is required (pick a product or type one in).' });
+    set('sku', body.sku.trim());
+  }
+  if ('product_id' in body) {
+    const r = parseOptionalId(body.product_id, 'Product');
+    if (r.error) return res.status(400).json({ success: false, message: r.error });
+    set('product_id', r.value);
+  }
+  if ('serial_number' in body) {
+    if (!body.serial_number?.trim()) return res.status(400).json({ success: false, message: 'Serial number is required.' });
+    set('serial_number', normalizeSerial(body.serial_number));
+  }
+  if ('sale_price' in body) {
+    const r = parsePrice(body.sale_price);
+    if (r.error) return res.status(400).json({ success: false, message: r.error });
+    set('sale_price', r.value);
+  }
+  if ('warranty_months' in body) {
+    const r = parseWarranty(body.warranty_months);
+    if (r.error) return res.status(400).json({ success: false, message: r.error });
+    set('warranty_months', r.value);
+  }
+  if ('order_id' in body) {
+    const r = parseOptionalId(body.order_id, 'Order ID');
+    if (r.error) return res.status(400).json({ success: false, message: r.error });
+    set('order_id', r.value);
+  }
+  if ('notes' in body) set('notes', body.notes?.trim() || null);
+  if ('sold_at' in body) {
+    const r = parseSoldAt(body.sold_at);
+    if (r.error) return res.status(400).json({ success: false, message: r.error });
+    set('sold_at', r.value);
+  }
+  if (sets.length === 0) {
+    return res.status(400).json({ success: false, message: 'Nothing to update.' });
+  }
+
+  try {
+    const found = await pool.query('SELECT offer_id, distributor_sale_id, distributor_id FROM product_serials WHERE id = $1', [id]);
+    if (found.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Sale not found.' });
+    }
+    const unit = found.rows[0];
+    if (unit.offer_id) {
+      return res.status(400).json({ success: false, message: `That unit is part of PC Offer #${unit.offer_id} — edit it from the offer.` });
+    }
+    if (unit.distributor_sale_id || unit.distributor_id) {
+      return res.status(400).json({ success: false, message: 'That unit is part of a distributor sale — edit it from Distributor Sales.' });
+    }
+
+    params.push(id);
+    await pool.query(`UPDATE product_serials SET ${sets.join(', ')} WHERE id = $${params.length}`, params);
+
+    const result = await pool.query(
+      `SELECT ps.*, p.name AS product_name,
+              CASE WHEN ps.warranty_months IS NOT NULL
+                   THEN ps.sold_at + (ps.warranty_months || ' months')::interval END AS warranty_expires_at,
+              ${STOCK_IN_COLUMNS}
+       FROM product_serials ps
+       LEFT JOIN products p ON p.id = ps.product_id
+       ${STOCK_IN_JOINS}
+       WHERE ps.id = $1`,
+      [id]
+    );
+    res.json({ success: true, data: result.rows[0] });
+  } catch (err) {
+    if (isUniqueViolation(err)) {
+      return res.status(409).json({ success: false, message: `Serial number "${duplicateSerialFrom(err) || body.serial_number}" is already on record.` });
+    }
+    if (err.code === '23503') {
+      return res.status(400).json({ success: false, message: 'That product or order no longer exists.' });
+    }
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ==========================================
+// DISTRIBUTOR SALES — one sale to a distributor, many SKUs, many serials
+// ==========================================
+// The header (distributor, date, order link, notes) is in distributor_sales;
+// each unit sold is a product_serials row with its own serial number, price
+// and warranty. Units copy the header's distributor / order / date, and are
+// kept in step whenever the header changes, so every existing warranty
+// lookup and inventory count keeps working without knowing about headers.
+
+const DISTRIBUTOR_UNIT_SELECT = `
+  SELECT ps.*, p.name AS product_name,
+         CASE WHEN ps.warranty_months IS NOT NULL
+              THEN ps.sold_at + (ps.warranty_months || ' months')::interval END AS warranty_expires_at,
+         ${STOCK_IN_COLUMNS}
+  FROM product_serials ps
+  LEFT JOIN products p ON p.id = ps.product_id
+  ${STOCK_IN_JOINS}`;
+
+async function loadDistributorSale(db, saleId) {
+  const head = await db.query(
+    `SELECT ds.*, d.name AS distributor_name
+     FROM distributor_sales ds JOIN distributors d ON d.id = ds.distributor_id
+     WHERE ds.id = $1`,
+    [saleId]
+  );
+  if (head.rows.length === 0) return null;
+  const units = await db.query(
+    `${DISTRIBUTOR_UNIT_SELECT}
+     WHERE ps.distributor_sale_id = $1
+     ORDER BY ps.sku ASC, ps.id ASC`,
+    [saleId]
+  );
+  const total = units.rows.reduce((sum, u) => sum + Number(u.sale_price || 0), 0);
+  return {
+    ...head.rows[0],
+    unit_count: units.rows.length,
+    total: total.toFixed(2),
+    units: units.rows,
+  };
+}
+
+// Validates one line of a distributor sale: { product_id?, sku, sale_price,
+// warranty_months?, serial_numbers: [...] }. Returns { line } or { error }.
+function parseDistributorLine(raw, label = 'Item') {
+  if (!raw || typeof raw !== 'object') return { error: `${label} is missing.` };
+  const sku = raw.sku?.trim();
+  if (!sku) return { error: `${label} needs a SKU (pick a product or type one in).` };
+  const productId = parseOptionalId(raw.product_id, 'Product');
+  if (productId.error) return { error: `${label}: ${productId.error}` };
+  const price = parsePrice(raw.sale_price, 'Unit price');
+  if (price.error) return { error: `${label} (${sku}): ${price.error}` };
+  const warranty = parseWarranty(raw.warranty_months);
+  if (warranty.error) return { error: `${label} (${sku}): ${warranty.error}` };
+  if (!Array.isArray(raw.serial_numbers)) return { error: `${label} (${sku}) needs at least one serial number.` };
+  const serials = raw.serial_numbers.map(normalizeSerial).filter(Boolean);
+  if (serials.length === 0) return { error: `${label} (${sku}) needs at least one serial number.` };
+  return { line: { sku, product_id: productId.value, sale_price: price.value, warranty_months: warranty.value, serials } };
+}
+
+// Serials must be unique across the whole request, not just within a line.
+function findRepeatedSerial(lines) {
+  const seen = new Set();
+  for (const line of lines) {
+    for (const sn of line.serials) {
+      if (seen.has(sn)) return sn;
+      seen.add(sn);
+    }
+  }
+  return null;
+}
+
+// Distributor / order / date are copied from the header inside SQL, so
+// they match it exactly (a round trip through JS would drop the
+// timestamp's microseconds).
+async function insertDistributorUnits(db, saleId, line) {
+  await db.query(
+    `INSERT INTO product_serials
+       (distributor_sale_id, distributor_id, order_id, sold_at, product_id, sku, sale_price, warranty_months, serial_number)
+     SELECT ds.id, ds.distributor_id, ds.order_id, ds.sold_at, $2, $3, $4, $5, sn
+     FROM distributor_sales ds, UNNEST($6::varchar[]) AS sn
+     WHERE ds.id = $1`,
+    [saleId, line.product_id, line.sku, line.sale_price, line.warranty_months, line.serials]
+  );
+}
+
+function distributorSaleError(res, err, fallbackSerial) {
+  if (isUniqueViolation(err)) {
+    const sn = duplicateSerialFrom(err) || fallbackSerial;
+    return res.status(409).json({
+      success: false,
+      message: sn ? `Serial number "${sn}" is already on record.` : 'One of those serial numbers is already on record.',
+    });
+  }
+  if (err.code === '23503') {
+    return res.status(400).json({ success: false, message: 'That distributor, order or product no longer exists.' });
+  }
+  return res.status(500).json({ success: false, error: err.message });
+}
+
+function parseSaleId(req, res) {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id) || id < 1) {
+    res.status(404).json({ success: false, message: 'Distributor sale not found.' });
+    return null;
+  }
+  return id;
+}
+
+router.get('/distributor-sales', requirePermission('serials.view'), async (req, res) => {
+  try {
+    const { page, limit, offset } = getPagination(req);
+    const { q, distributor_id } = req.query;
+    const conditions = [];
+    const params = [];
+
+    if (!blank(distributor_id)) {
+      params.push(Number(distributor_id));
+      conditions.push(`ds.distributor_id = $${params.length}`);
+    }
+    // One search box: sale number, distributor name, notes, or any SKU /
+    // serial number in the sale.
+    if (q?.trim()) {
+      params.push(`%${q.trim()}%`);
+      const i = params.length;
+      const idMatch = /^#?\d+$/.test(q.trim()) ? ` OR ds.id = ${Number(q.trim().replace('#', ''))}` : '';
+      conditions.push(`(
+        d.name ILIKE $${i} OR ds.notes ILIKE $${i}${idMatch}
+        OR EXISTS (
+          SELECT 1 FROM product_serials x
+          WHERE x.distributor_sale_id = ds.id AND (x.serial_number ILIKE $${i} OR x.sku ILIKE $${i})
+        )
+      )`);
+    }
+    const whereClause = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    const sql = `
+      SELECT ds.*, d.name AS distributor_name,
+             COUNT(ps.id)::int AS unit_count,
+             COUNT(DISTINCT ps.sku)::int AS sku_count,
+             COALESCE(SUM(ps.sale_price), 0)::numeric(12,2) AS total
+      FROM distributor_sales ds
+      JOIN distributors d ON d.id = ds.distributor_id
+      LEFT JOIN product_serials ps ON ps.distributor_sale_id = ds.id
+      ${whereClause}
+      GROUP BY ds.id, d.name
+      ORDER BY ds.sold_at DESC, ds.id DESC
+      LIMIT $${params.length + 1} OFFSET $${params.length + 2}
+    `;
+    const countSql = `
+      SELECT COUNT(*)::int AS count FROM distributor_sales ds
+      JOIN distributors d ON d.id = ds.distributor_id ${whereClause}`;
+
+    const [rows, count] = await Promise.all([
+      pool.query(sql, [...params, limit, offset]),
+      pool.query(countSql, params),
+    ]);
+    res.json({ success: true, data: rows.rows, pagination: paginationMeta(page, limit, count.rows[0].count) });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+router.get('/distributor-sales/:id', requirePermission('serials.view'), async (req, res) => {
+  const id = parseSaleId(req, res);
+  if (!id) return;
+  try {
+    const sale = await loadDistributorSale(pool, id);
+    if (!sale) return res.status(404).json({ success: false, message: 'Distributor sale not found.' });
+    res.json({ success: true, data: sale });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Record a distributor sale:
+// { distributor_id, order_id?, notes?, sold_at?,
+//   lines: [{ product_id?, sku, sale_price (per unit), warranty_months?, serial_numbers: [...] }, ...] }
+router.post('/distributor-sales', requirePermission('serials.manage'), async (req, res) => {
+  const body = req.body || {};
+  const distributorId = parseOptionalId(body.distributor_id, 'Distributor');
+  if (distributorId.error || distributorId.value === null) {
+    return res.status(400).json({ success: false, message: 'Pick which distributor this sale is to.' });
+  }
+  const orderId = parseOptionalId(body.order_id, 'Order ID');
+  if (orderId.error) return res.status(400).json({ success: false, message: orderId.error });
+  let soldAt = null;
+  if (!blank(body.sold_at)) {
+    const r = parseSoldAt(body.sold_at);
+    if (r.error) return res.status(400).json({ success: false, message: r.error });
+    soldAt = r.value;
+  }
+  if (!Array.isArray(body.lines) || body.lines.length === 0) {
+    return res.status(400).json({ success: false, message: 'Add at least one item with its serial numbers.' });
+  }
+  const lines = [];
+  for (const [i, raw] of body.lines.entries()) {
+    const r = parseDistributorLine(raw, `Item ${i + 1}`);
+    if (r.error) return res.status(400).json({ success: false, message: r.error });
+    lines.push(r.line);
+  }
+  const repeated = findRepeatedSerial(lines);
+  if (repeated) {
+    return res.status(400).json({ success: false, message: `Serial number "${repeated}" is listed more than once in this sale.` });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const head = await client.query(
+      `INSERT INTO distributor_sales (distributor_id, order_id, notes, sold_at)
+       VALUES ($1, $2, $3, COALESCE($4::timestamptz, NOW()))
+       RETURNING *`,
+      [distributorId.value, orderId.value, body.notes?.trim() || null, soldAt]
+    );
+    for (const line of lines) {
+      await insertDistributorUnits(client, head.rows[0].id, line);
+    }
+    const sale = await loadDistributorSale(client, head.rows[0].id);
+    await client.query('COMMIT');
+    res.status(201).json({ success: true, data: sale });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    distributorSaleError(res, err);
+  } finally {
+    client.release();
+  }
+});
+
+// Edit the sale header: distributor, order link, notes, sale date. The
+// units are updated to match in the same transaction.
+router.patch('/distributor-sales/:id', requirePermission('serials.manage'), async (req, res) => {
+  const id = parseSaleId(req, res);
+  if (!id) return;
+  const body = req.body || {};
+  const sets = [];
+  const params = [];
+  const set = (col, value) => {
+    params.push(value);
+    sets.push(`${col} = $${params.length}`);
+  };
+
+  if ('distributor_id' in body) {
+    const r = parseOptionalId(body.distributor_id, 'Distributor');
+    if (r.error || r.value === null) return res.status(400).json({ success: false, message: 'Pick which distributor this sale is to.' });
+    set('distributor_id', r.value);
+  }
+  if ('order_id' in body) {
+    const r = parseOptionalId(body.order_id, 'Order ID');
+    if (r.error) return res.status(400).json({ success: false, message: r.error });
+    set('order_id', r.value);
+  }
+  if ('notes' in body) set('notes', body.notes?.trim() || null);
+  if ('sold_at' in body) {
+    const r = parseSoldAt(body.sold_at);
+    if (r.error) return res.status(400).json({ success: false, message: r.error });
+    set('sold_at', r.value);
+  }
+  if (sets.length === 0) return res.status(400).json({ success: false, message: 'Nothing to update.' });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    params.push(id);
+    const head = await client.query(
+      `UPDATE distributor_sales SET ${sets.join(', ')} WHERE id = $${params.length} RETURNING *`,
+      params
+    );
+    if (head.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'Distributor sale not found.' });
+    }
+    await client.query(
+      `UPDATE product_serials ps
+       SET distributor_id = ds.distributor_id, order_id = ds.order_id, sold_at = ds.sold_at
+       FROM distributor_sales ds
+       WHERE ds.id = $1 AND ps.distributor_sale_id = ds.id`,
+      [id]
+    );
+    const sale = await loadDistributorSale(client, id);
+    await client.query('COMMIT');
+    res.json({ success: true, data: sale });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    distributorSaleError(res, err);
+  } finally {
+    client.release();
+  }
+});
+
+router.delete('/distributor-sales/:id', requirePermission('serials.manage'), async (req, res) => {
+  const id = parseSaleId(req, res);
+  if (!id) return;
+  try {
+    // Units cascade-delete with the header (distributor_sale_id ON DELETE CASCADE).
+    const result = await pool.query('DELETE FROM distributor_sales WHERE id = $1 RETURNING id', [id]);
+    if (result.rows.length === 0) return res.status(404).json({ success: false, message: 'Distributor sale not found.' });
+    res.json({ success: true, message: 'Distributor sale deleted.' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Add units to a sale — either more serials for an item already in it, or
+// a new item. Same shape as one line of the create request.
+router.post('/distributor-sales/:id/units', requirePermission('serials.manage'), async (req, res) => {
+  const id = parseSaleId(req, res);
+  if (!id) return;
+  const r = parseDistributorLine(req.body, 'Item');
+  if (r.error) return res.status(400).json({ success: false, message: r.error });
+  const repeated = findRepeatedSerial([r.line]);
+  if (repeated) return res.status(400).json({ success: false, message: `Serial number "${repeated}" is listed more than once.` });
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const head = await client.query('SELECT * FROM distributor_sales WHERE id = $1 FOR UPDATE', [id]);
+    if (head.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'Distributor sale not found.' });
+    }
+    await insertDistributorUnits(client, id, r.line);
+    const sale = await loadDistributorSale(client, id);
+    await client.query('COMMIT');
+    res.status(201).json({ success: true, data: sale });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    distributorSaleError(res, err);
+  } finally {
+    client.release();
+  }
+});
+
+// Change price / warranty / product for several units at once — this is
+// how a whole item line is edited ("all 10 mice are $12, 6 months").
+// Body: { unit_ids: [...], sale_price?, warranty_months?, product_id?, sku? }
+async function updateDistributorUnits(req, res, unitIds, allowSerial) {
+  const id = parseSaleId(req, res);
+  if (!id) return;
+  const body = req.body || {};
+  const sets = [];
+  const params = [];
+  const set = (col, value) => {
+    params.push(value);
+    sets.push(`${col} = $${params.length}`);
+  };
+
+  if (!Array.isArray(unitIds) || unitIds.length === 0 || !unitIds.every((u) => Number.isInteger(u) && u > 0)) {
+    return res.status(400).json({ success: false, message: 'Pick which units to change.' });
+  }
+  if ('sku' in body) {
+    if (!body.sku?.trim()) return res.status(400).json({ success: false, message: 'SKU is required (pick a product or type one in).' });
+    set('sku', body.sku.trim());
+  }
+  if ('product_id' in body) {
+    const r = parseOptionalId(body.product_id, 'Product');
+    if (r.error) return res.status(400).json({ success: false, message: r.error });
+    set('product_id', r.value);
+  }
+  if ('sale_price' in body) {
+    const r = parsePrice(body.sale_price, 'Unit price');
+    if (r.error) return res.status(400).json({ success: false, message: r.error });
+    set('sale_price', r.value);
+  }
+  if ('warranty_months' in body) {
+    const r = parseWarranty(body.warranty_months);
+    if (r.error) return res.status(400).json({ success: false, message: r.error });
+    set('warranty_months', r.value);
+  }
+  if ('serial_number' in body) {
+    if (!allowSerial) return res.status(400).json({ success: false, message: 'Serial numbers are edited one unit at a time.' });
+    if (!body.serial_number?.trim()) return res.status(400).json({ success: false, message: 'Serial number is required.' });
+    set('serial_number', normalizeSerial(body.serial_number));
+  }
+  if (sets.length === 0) return res.status(400).json({ success: false, message: 'Nothing to update.' });
+
+  try {
+    params.push(unitIds, id);
+    const result = await pool.query(
+      `UPDATE product_serials SET ${sets.join(', ')}
+       WHERE id = ANY($${params.length - 1}::int[]) AND distributor_sale_id = $${params.length}
+       RETURNING id`,
+      params
+    );
+    // Only units that belong to this sale are ever touched (ids from other
+    // sales are simply not matched by the WHERE clause above).
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, message: 'Those units are not in this distributor sale.' });
+    }
+    const sale = await loadDistributorSale(pool, id);
+    if (!sale) return res.status(404).json({ success: false, message: 'Distributor sale not found.' });
+    res.json({ success: true, data: sale });
+  } catch (err) {
+    distributorSaleError(res, err, body.serial_number && normalizeSerial(body.serial_number));
+  }
+}
+
+router.patch('/distributor-sales/:id/units', requirePermission('serials.manage'), (req, res) =>
+  updateDistributorUnits(req, res, (req.body?.unit_ids || []).map(Number), false)
+);
+
+// One unit: fix its serial number (or its price / warranty / product).
+router.patch('/distributor-sales/:id/units/:unitId', requirePermission('serials.manage'), (req, res) =>
+  updateDistributorUnits(req, res, [Number(req.params.unitId)], true)
+);
+
+// Remove units from a sale — one (DELETE .../units/:unitId) or several
+// (DELETE .../units with { unit_ids }), e.g. a whole item line. A sale
+// can't be emptied this way; delete the sale instead.
+async function removeDistributorUnits(req, res, unitIds) {
+  const id = parseSaleId(req, res);
+  if (!id) return;
+  if (!Array.isArray(unitIds) || unitIds.length === 0 || !unitIds.every((u) => Number.isInteger(u) && u > 0)) {
+    return res.status(400).json({ success: false, message: 'Pick which units to remove.' });
+  }
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const head = await client.query('SELECT id FROM distributor_sales WHERE id = $1 FOR UPDATE', [id]);
+    if (head.rows.length === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'Distributor sale not found.' });
+    }
+    const counts = await client.query(
+      `SELECT COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE id = ANY($2::int[]))::int AS matched
+       FROM product_serials WHERE distributor_sale_id = $1`,
+      [id, unitIds]
+    );
+    const { total, matched } = counts.rows[0];
+    if (matched === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, message: 'Those units are not in this distributor sale.' });
+    }
+    if (matched >= total) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        success: false,
+        message: "That would leave this sale with no units — delete the whole sale instead.",
+      });
+    }
+    await client.query('DELETE FROM product_serials WHERE distributor_sale_id = $1 AND id = ANY($2::int[])', [id, unitIds]);
+    const sale = await loadDistributorSale(client, id);
+    await client.query('COMMIT');
+    res.json({ success: true, data: sale });
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    res.status(500).json({ success: false, error: err.message });
+  } finally {
+    client.release();
+  }
+}
+
+router.delete('/distributor-sales/:id/units', requirePermission('serials.manage'), (req, res) =>
+  removeDistributorUnits(req, res, (req.body?.unit_ids || []).map(Number))
+);
+router.delete('/distributor-sales/:id/units/:unitId', requirePermission('serials.manage'), (req, res) =>
+  removeDistributorUnits(req, res, [Number(req.params.unitId)])
+);
 
 // Computed, not stored: remaining = total received (stock_receipts) minus
 // total sold (product_serials rows for that SKU, including PC Offer items

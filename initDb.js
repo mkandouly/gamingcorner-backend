@@ -203,6 +203,53 @@ export async function initializeDatabase() {
   const alterProductSerialsAddDistributor = `
     ALTER TABLE product_serials ADD COLUMN IF NOT EXISTS distributor_id INT REFERENCES distributors(id) ON DELETE SET NULL;
   `;
+  // A distributor sale is one transaction with a distributor that can hold
+  // many units across many SKUs (e.g. 10x mouse + 5x keyboard), each unit
+  // with its own serial number and price. The header (who, when, notes,
+  // order link) lives here; the units live in product_serials with
+  // distributor_sale_id set — and distributor_id kept in step with the
+  // header, so warranty lookups and filters keep working unchanged.
+  // A distributor that has sales on record can't be deleted (RESTRICT),
+  // so a sale never loses track of who it went to.
+  const createDistributorSalesTable = `
+    CREATE TABLE IF NOT EXISTS distributor_sales (
+      id SERIAL PRIMARY KEY,
+      distributor_id INT NOT NULL REFERENCES distributors(id) ON DELETE RESTRICT,
+      order_id INT REFERENCES orders(id) ON DELETE SET NULL,
+      notes TEXT,
+      sold_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+  `;
+  const alterProductSerialsAddDistributorSale = `
+    ALTER TABLE product_serials ADD COLUMN IF NOT EXISTS distributor_sale_id INT REFERENCES distributor_sales(id) ON DELETE CASCADE;
+  `;
+  const createSerialsDistributorSaleIndex = `
+    CREATE INDEX IF NOT EXISTS idx_product_serials_distributor_sale_id ON product_serials(distributor_sale_id);
+  `;
+  // One-time upgrade for distributor sales recorded before sales had a
+  // header: each old single-unit distributor sale becomes its own
+  // one-unit sale, carrying over its distributor, date, order and notes.
+  // Only touches rows that don't have a header yet, so re-running on
+  // every startup is a no-op.
+  const backfillDistributorSales = `
+    DO $$
+    DECLARE r RECORD; new_id INT;
+    BEGIN
+      FOR r IN
+        SELECT id, distributor_id, order_id, notes, sold_at
+        FROM product_serials
+        WHERE distributor_id IS NOT NULL AND distributor_sale_id IS NULL AND offer_id IS NULL
+        ORDER BY id
+      LOOP
+        INSERT INTO distributor_sales (distributor_id, order_id, notes, sold_at)
+        VALUES (r.distributor_id, r.order_id, r.notes, r.sold_at)
+        RETURNING id INTO new_id;
+        UPDATE product_serials SET distributor_sale_id = new_id WHERE id = r.id;
+      END LOOP;
+    END $$;
+  `;
+
   const createSerialsDistributorIndex = `
     CREATE INDEX IF NOT EXISTS idx_product_serials_distributor_id ON product_serials(distributor_id);
   `;
@@ -429,6 +476,10 @@ export async function initializeDatabase() {
     await query(alterProductSerialsForOffers);
     await query(alterProductSerialsAddDistributor);
     await query(createSerialsDistributorIndex);
+    await query(createDistributorSalesTable);
+    await query(alterProductSerialsAddDistributorSale);
+    await query(createSerialsDistributorSaleIndex);
+    await query(backfillDistributorSales);
     await query(createSerialsSkuIndex);
     await query(createSerialsOfferIndex);
 

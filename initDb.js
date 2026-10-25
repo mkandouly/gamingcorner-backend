@@ -250,6 +250,50 @@ export async function initializeDatabase() {
     END $$;
   `;
 
+  // Client sales work exactly like distributor sales — one header, many
+  // items, many serials — but the buyer is a walk-in or online customer
+  // rather than a registered distributor, so the header just has an
+  // optional name and phone for them.
+  const createClientSalesTable = `
+    CREATE TABLE IF NOT EXISTS client_sales (
+      id SERIAL PRIMARY KEY,
+      customer_name VARCHAR(255),
+      customer_phone VARCHAR(50),
+      order_id INT REFERENCES orders(id) ON DELETE SET NULL,
+      notes TEXT,
+      sold_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+  `;
+  const alterProductSerialsAddClientSale = `
+    ALTER TABLE product_serials ADD COLUMN IF NOT EXISTS client_sale_id INT REFERENCES client_sales(id) ON DELETE CASCADE;
+  `;
+  const createSerialsClientSaleIndex = `
+    CREATE INDEX IF NOT EXISTS idx_product_serials_client_sale_id ON product_serials(client_sale_id);
+  `;
+  // One-time upgrade: every single-unit client sale recorded before
+  // client sales had a header becomes its own one-unit sale, keeping its
+  // date, order and notes. Skips PC Offer items and distributor units, and
+  // anything already converted, so re-running on startup is a no-op.
+  const backfillClientSales = `
+    DO $$
+    DECLARE r RECORD; new_id INT;
+    BEGIN
+      FOR r IN
+        SELECT id, order_id, notes, sold_at
+        FROM product_serials
+        WHERE client_sale_id IS NULL AND offer_id IS NULL
+          AND distributor_sale_id IS NULL AND distributor_id IS NULL
+        ORDER BY id
+      LOOP
+        INSERT INTO client_sales (order_id, notes, sold_at)
+        VALUES (r.order_id, r.notes, r.sold_at)
+        RETURNING id INTO new_id;
+        UPDATE product_serials SET client_sale_id = new_id WHERE id = r.id;
+      END LOOP;
+    END $$;
+  `;
+
   const createSerialsDistributorIndex = `
     CREATE INDEX IF NOT EXISTS idx_product_serials_distributor_id ON product_serials(distributor_id);
   `;
@@ -480,6 +524,10 @@ export async function initializeDatabase() {
     await query(alterProductSerialsAddDistributorSale);
     await query(createSerialsDistributorSaleIndex);
     await query(backfillDistributorSales);
+    await query(createClientSalesTable);
+    await query(alterProductSerialsAddClientSale);
+    await query(createSerialsClientSaleIndex);
+    await query(backfillClientSales);
     await query(createSerialsSkuIndex);
     await query(createSerialsOfferIndex);
 
